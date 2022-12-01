@@ -1,0 +1,313 @@
+---
+title: "week7"
+author: "Jin Jiang"
+date: "2022-11-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(here)
+library(janitor)
+library(sf)
+library(tidyverse)
+library(tmap)
+```
+1. Preparation work
+```{r}
+#read in London Wards data
+LondonWards <- st_read(here::here("rawdata/statistical-gis-boundaries-london/ESRI/London_Ward.shp"))
+  
+LondonWardsMerged <- st_read(here::here("rawdata/statistical-gis-boundaries-london/ESRI/London_Ward_CityMerged.shp"))
+  #st_transform
+```
+
+```{r}
+#read in Ward Data csv
+WardData <- read_csv("https://data.london.gov.uk/download/ward-profiles-and-atlas/772d2d64-e8c6-46cb-86f9-e52b4c7851bc/ward-profiles-excel-version.csv",
+                    locale = locale(encoding = "latin1"),
+                     na = c("NA", "n/a")) %>% 
+  clean_names()  #remember to clean the name of csvfile data
+```
+select and check 
+```{r}
+LondonWardsMerged2 <- LondonWardsMerged %>%
+  left_join(WardData, by = c("GSS_CODE"="new_code")) %>%   
+  #JIN: Why are columns names from WardData added ".x"
+  dplyr::distinct(GSS_CODE, .keep_all = T)  # remove duplicates
+```
+
+```{r}
+# LondonWardsMerged2 <- LondonWardsMerged2 %>% 
+#         rename("ward_name.x" = "ward_name")
+```
+
+```{r}
+LondonWardsMerged2 <- LondonWardsMerged2 %>%
+  dplyr::select(GSS_CODE, ward_name, average_gcse_capped_point_scores_2014) 
+```
+
+```{r}
+LondonWardsMerged2 <- st_transform(LondonWardsMerged2, 27700)  #I need to save it, instead of just transform it
+st_crs(LondonWardsMerged2)
+
+```
+```{r}
+library(tmap)
+BluePlaques <- st_read(here::here("rawdata/open-plaques-london-2018-04-08.geojson")) %>%
+  st_transform(.,27700)
+```
+
+```{r}
+tmap_mode("plot")
+tm_shape(LondonWardsMerged2) +
+  tm_polygons(col = NA, alpha = 0.5) +
+tm_shape(BluePlaques)+
+  tm_dots(col="blue")
+```
+
+
+
+```{r}
+#remove the outlier outside London
+BluePlaquesub <- BluePlaques[LondonWardsMerged2,]
+tm_shape(LondonWardsMerged2) +
+  tm_polygons(col = NA, alpha = 0.5) +
+tm_shape(BluePlaquesub)+
+  tm_dots(col="blue")
+```
+Data manipulation
+```{r}
+#calculate the points falling into each wards
+Example <- st_intersects(LondonWardsMerged2,BluePlaquesub)
+Example
+```
+
+
+```{r}
+# choose the 6th wards to check
+check_example <- LondonWardsMerged2 %>%
+  dplyr::filter(ward_name == "Kingston upon Thames - Coombe Hill") %>%
+  st_intersects(BluePlaquesub)
+```
+
+```{r}
+#take the length of each list per polygon(ward) and add this as a new column
+points_sf_joined <- LondonWardsMerged2 %>%
+  mutate(n=lengths(st_intersects(LondonWardsMerged2,BluePlaquesub))) %>%
+  janitor::clean_names() %>%
+  #calculate the area and density
+  mutate(area = st_area(.)) %>%
+  mutate(density = n/area)
+
+```
+
+```{r}
+#a quick choropleth map
+points_sf_joined <- points_sf_joined %>%
+  group_by(gss_code) %>%
+  summarise(density=first(density), ward_name=first(ward_name),plaguecount=first(n))  #what does this step mean?
+
+tm_shape(points_sf_joined) +
+    tm_polygons("density",
+        style="jenks",
+        palette="PuOr",
+        midpoint=NA,
+        popup.vars=c("wardname", "density"),
+        title="Blue Plaque Density")
+```
+Clustering seems exist? use Moran's I to check...
+```{r}
+library(spdep)
+#First calculate the centroids of all Wards in London
+coordsWard <- points_sf_joined %>%
+  st_centroid()%>%
+  st_geometry()
+plot(coordsWard,axes=TRUE)
+```
+```{r}
+#create a neighbour list
+LWard_nb <-points_sf_joined %>%
+  poly2nb(.,queen = T)
+summary(LWard_nb)
+```
+```{r}
+# plot link lines and centre circles
+plot(LWard_nb, st_geometry(coordsWard), col="red")
+# add a map underneath
+plot(points_sf_joined$geometry, add= T) 
+  # without "add= T", it will be plotted seperately
+```
+
+```{r}
+# Matrix style
+# create a spatial weights matrix from these weights (neighbouring list?)
+LWard_lw <- LWard_nb %>%
+  nb2mat(., style = "B")
+sum(LWard_lw)  #sum of vector elements
+```
+```{r}
+#try global standardisation
+LWard_lw_global <- LWard_nb %>%
+  nb2mat(., style = "C")
+sum(LWard_lw_global) 
+```
+```{r}
+sum(LWard_lw[1,])
+```
+Autocorrelation
+```{r}
+#well, actually we need a list not a matrix
+Lward.lw <- LWard_nb %>%
+  nb2listw(., style = "C")
+#calculate Moran's I for blueplaques' density
+I_LWard_Global_Density <- points_sf_joined %>%
+  pull(density) %>%
+  as.vector()%>%
+  moran.test(., Lward.lw)
+
+I_LWard_Global_Density
+```
+```{r}
+C_LWard_Global_Density <- points_sf_joined %>%
+  pull(density) %>%
+  as.vector()%>%
+  geary.test(., Lward.lw)
+
+C_LWard_Global_Density
+```
+```{r}
+G_LWard_Global_Density <- points_sf_joined %>%
+  pull(density) %>%
+  as.vector()%>%
+  globalG.test(., Lward.lw)
+
+G_LWard_Global_Density
+```
+Local Moran's I
+```{r}
+#use the localmoran function to generate I for each ward in the city
+I_LWard_Local_count <- points_sf_joined %>%
+  pull(plaguecount) %>%
+  as.vector() %>%
+  localmoran(., Lward.lw) %>%
+  as_tibble()
+
+I_LWard_Local_Density <- points_sf_joined %>%
+  pull(density) %>%
+  as.vector() %>%
+  localmoran(., Lward.lw) %>%
+  as_tibble()
+
+slice_head(I_LWard_Local_Density, n=5)
+```
+
+```{r}
+#JIN: ??? 还是没懂local moran's I 
+#copy I value and z-score back to Londonwards spatial Polygons Dataframe
+points_sf_joined <- points_sf_joined %>%
+  mutate(plaque_count_I = as.numeric((I_LWard_Local_count$Ii))) %>%
+  mutate(plaque_count_Iz=as.numeric((I_LWard_Local_count$Z.Ii))) %>%
+  mutate(density_I = as.numeric((I_LWard_Local_Density$Ii))) %>%
+  mutate(density_Iz=as.numeric((I_LWard_Local_Density$Z.Ii)))
+```
+
+Plot
+```{r}
+breaks1 <- c(-1000,-2.58,-1.96,-1.65,1.65,1.96,2.58,1000)
+library(RColorBrewer)
+MoranColours <- rev(brewer.pal(8,"RdGy"))
+```
+
+```{r}
+tm_shape(points_sf_joined) +
+    tm_polygons("plaque_count_Iz",
+        style="fixed",
+        breaks= breaks1,
+        palette= MoranColours,
+        midpoint=NA,
+        title="Local Moran's I, Blue Plaques in London")
+```
+Local Getis Ord  G∗i
+```{r}
+
+Gi_LWard_Local_Density <- points_sf_joined %>%
+  pull(density) %>%
+  as.vector()%>%
+  localG(., Lward.lw)
+
+head(Gi_LWard_Local_Density)
+
+points_sf_joined <- points_sf_joined %>%
+  mutate(density_G = as.numeric(Gi_LWard_Local_Density))
+```
+
+```{r}
+GIColours<- rev(brewer.pal(8, "RdBu"))
+
+tm_shape(points_sf_joined) +
+    tm_polygons("density_G",
+        style="fixed",
+        breaks=breaks1,
+        palette=GIColours,
+        midpoint=NA,
+        title="Gi*, Blue Plaques in London")
+```
+```{r}
+slice_head(points_sf_joined,n=2)
+```
+```{r}
+#print outthe class of each column
+Datatypelist <- LondonWardsMerged2 %>% 
+  st_drop_geometry()%>%
+  summarise_all(class) %>%
+  pivot_longer(everything(), 
+               names_to="All_variables", 
+               values_to="Variable_class")
+
+Datatypelist
+```
+```{r}
+I_LWard_Local_GCSE <- LondonWardsMerged2 %>%
+  dplyr::arrange(GSS_CODE)%>%  #arrange?
+  dplyr::pull(average_gcse_capped_point_scores_2014) %>%
+  as.vector()%>%
+  localmoran(., Lward.lw)%>%
+  as_tibble()
+
+points_sf_joined <- points_sf_joined %>%
+  dplyr::arrange(gss_code)%>%
+  dplyr::mutate(GCSE_LocIz = as.numeric(I_LWard_Local_GCSE$Z.Ii))
+
+
+tm_shape(points_sf_joined) +
+    tm_polygons("GCSE_LocIz",
+        style="fixed",
+        breaks=breaks1,
+        palette=MoranColours,
+        midpoint=NA,
+        title="Local Moran's I, GCSE Scores")
+```
+```{r}
+G_LWard_Local_GCSE <- LondonWardsMerged2 %>%
+  dplyr::arrange(GSS_CODE)%>%
+  dplyr::pull(average_gcse_capped_point_scores_2014) %>%
+  as.vector()%>%
+  localG(., Lward.lw)
+
+points_sf_joined <- points_sf_joined %>%
+  dplyr::arrange(gss_code)%>%
+  dplyr::mutate(GCSE_LocGiz = as.numeric(G_LWard_Local_GCSE))
+
+tm_shape(points_sf_joined) +
+    tm_polygons("GCSE_LocGiz",
+        style="fixed",
+        breaks=breaks1,
+        palette=GIColours,
+        midpoint=NA,
+        title="Gi*, GCSE Scores")
+```
+
